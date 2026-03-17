@@ -165,6 +165,49 @@
             display: block;
         }
 
+        .evaluation-section {
+            background: white;
+            border-radius: 15px;
+            padding: 25px;
+            margin-bottom: 25px;
+            box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+            display: none;
+        }
+
+        .evaluation-section.show {
+            display: block;
+        }
+
+        .evaluation-meta {
+            color: #555;
+            margin-bottom: 15px;
+            font-size: 0.95em;
+            line-height: 1.5;
+        }
+
+        .evaluation-table {
+            width: 100%;
+            border-collapse: collapse;
+            margin-top: 10px;
+        }
+
+        .evaluation-table th,
+        .evaluation-table td {
+            border: 1px solid #e2e8f0;
+            padding: 10px;
+            text-align: left;
+        }
+
+        .evaluation-table th {
+            background: #f1f5f9;
+            color: #0f172a;
+        }
+
+        .evaluation-rank {
+            font-weight: 700;
+            color: #003d7a;
+        }
+
         .recommendation-category {
             background: white;
             border-radius: 15px;
@@ -311,6 +354,7 @@
             <div class="button-group">
                 <button class="btn-submit" id="submitBtn" onclick="submitRatings()">Get Recommendations</button>
                 <button class="btn-reset" id="resetBtn" onclick="resetRatings()">Reset Ratings</button>
+                <button class="btn-reset" id="evaluationBtn" onclick="loadEvaluation()">Show Objective Evaluation</button>
             </div>
 
             <div class="error-message" id="errorMessage"></div>
@@ -353,6 +397,25 @@
 
             <div class="button-group" style="margin-top: 30px;">
                 <button class="btn-reset" onclick="resetAll()">Rate Different Jokes</button>
+                <button class="btn-reset" onclick="loadEvaluation()">Show Objective Evaluation</button>
+            </div>
+        </div>
+
+        <div class="evaluation-section" id="evaluationSection">
+            <h2 style="color: #003d7a; margin-bottom: 10px; font-size: 2em;">Objective Evaluation Results</h2>
+            <p class="evaluation-meta" id="evaluationMeta"></p>
+            <div style="overflow-x: auto;">
+                <table class="evaluation-table">
+                    <thead>
+                        <tr>
+                            <th>Rank</th>
+                            <th>Method</th>
+                            <th>Recall@10</th>
+                            <th>Top@10</th>
+                        </tr>
+                    </thead>
+                    <tbody id="evaluationTableBody"></tbody>
+                </table>
             </div>
         </div>
     </div>
@@ -501,6 +564,44 @@
             document.getElementById('recommendationsSection').classList.remove('show');
             document.getElementById('ratingSection').style.display = 'block';
             window.scrollTo(0, 0);
+        }
+
+        function loadEvaluation() {
+            const section = document.getElementById('evaluationSection');
+            const meta = document.getElementById('evaluationMeta');
+            const tableBody = document.getElementById('evaluationTableBody');
+
+            section.classList.add('show');
+            meta.textContent = 'Loading objective evaluation results...';
+            tableBody.innerHTML = '';
+
+            fetch('/evaluation-results')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        meta.textContent = `Error loading evaluation: ${data.error}`;
+                        return;
+                    }
+
+                    const split = data.split;
+                    meta.textContent = `Per-user joke holdout: ${split.train_percent}%/${split.test_percent}% | Metrics: ${data.metric_name} and ${data.top_metric_name} | Top@10 definition: ${data.top_metric_definition} | Relevant test joke for Recall@10: rating > ${data.relevance_threshold} | Train ratings: ${split.train_count.toLocaleString()} | Test ratings: ${split.test_count.toLocaleString()} | Users (Recall@10): ${split.users_evaluated.toLocaleString()} | Users (Top@10): ${split.users_top_evaluated.toLocaleString()} | Seed: ${split.random_state} | Generated: ${data.generated_at}`;
+
+                    data.metrics.forEach((row, index) => {
+                        const tr = document.createElement('tr');
+                        tr.innerHTML = `
+                            <td class="evaluation-rank">${index + 1}</td>
+                            <td>${row.method}</td>
+                            <td>${row.recall_score.toFixed(4)}</td>
+                            <td>${row.top_score.toFixed(4)}</td>
+                        `;
+                        tableBody.appendChild(tr);
+                    });
+
+                    section.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                })
+                .catch(error => {
+                    meta.textContent = `Error loading evaluation: ${error.message}`;
+                });
         }
 
         // Initialize on page load
