@@ -265,73 +265,68 @@ def memory_based_cf(ratings_df, min_ratings_per_user=5):
 # ==========================================
 
 def deep_learning_recommender(ratings_df, jokes_df):
-    """Deep learning two-tower model using your loaded data"""
-    print("--- DEEP LEARNING MODEL (Two-Tower Retrieval) ---")
-    
+    """Simple MLP Recommender model based on user-item concatenation"""
+    print("--- MLP DEEP LEARNING MODEL ---")
     try:
         import tensorflow as tf
-        import tensorflow_recommenders as tfrs
-    except (ImportError, RecursionError) as e:
-        print(f"Error: tensorflow_recommenders not available or has compatibility issues.")
-        print(f"Details: {type(e).__name__}: {str(e)[:100]}")
-        print(f"Skipping deep learning model. Other recommendation methods will still work.")
+        from tensorflow.keras.layers import Input, Embedding, Flatten, Concatenate, Dense
+        from tensorflow.keras.models import Model
+    except ImportError:
+        print(f"Error: tensorflow not available.")
         return None
     
-    print("Preparing data for deep learning model...")
+    # 1. Data Preparation
     ratings_df_copy = ratings_df.dropna(subset=['rating']).copy()
-    ratings_df_copy['user_id'] = ratings_df_copy['user_id'].astype(str)
-    ratings_df_copy['joke_id'] = ratings_df_copy['joke_id'].astype(str)
+    ratings_df_copy['user_id'] = ratings_df_copy['user_id'].astype(int)
+    ratings_df_copy['joke_id'] = ratings_df_copy['joke_id'].astype(int)
 
-    ratings = tf.data.Dataset.from_tensor_slices(dict(ratings_df_copy[['user_id', 'joke_id']]))
-    jokes = tf.data.Dataset.from_tensor_slices(jokes_df['joke_id'].astype(str).values)
+    num_users = ratings_df_copy['user_id'].max() + 1
+    num_items = ratings_df_copy['joke_id'].max() + 1
 
-    # Build the Model
-    class JesterModel(tfrs.Model):
-        def __init__(self, num_users, num_items):
-            super().__init__()
-            self.user_model = tf.keras.layers.Embedding(input_dim=num_users, output_dim=64)
-            self.item_model = tf.keras.layers.Embedding(input_dim=num_items, output_dim=64)
-            
-            self.task = tfrs.tasks.Retrieval(
-                metrics=tfrs.metrics.FactorizedTopK(
-                    candidates=jokes.batch(128).map(self.item_model)
-                )
-            )
+    # Hyperparameters
+    embedding_dim = 32 # Dimension for p_u and q_i
 
-        def compute_loss(self, features, training=False):
-            user_embeddings = self.user_model(features["user_id"])
-            joke_embeddings = self.item_model(features["joke_id"])
-            return self.task(user_embeddings, joke_embeddings)
+    # 2. Embedding Layer (Step 1 in your description)
+    user_input = Input(shape=(1,), name='user_input')
+    item_input = Input(shape=(1,), name='item_input')
 
-    num_users = int(ratings_df_copy['user_id'].astype(int).max()) + 1
-    num_items = int(ratings_df_copy['joke_id'].astype(int).max()) + 1
+    user_emb = Embedding(input_dim=num_users, output_dim=embedding_dim, name='user_emb')(user_input)
+    item_emb = Embedding(input_dim=num_items, output_dim=embedding_dim, name='item_emb')(item_input)
+
+    user_flat = Flatten()(user_emb)
+    item_flat = Flatten()(item_emb)
+
+    # 3. Concatenation (Step 2: z_0 = [p_u, q_i])
+    mlp_vector = Concatenate()([user_flat, item_flat])
     
-    model = JesterModel(num_users, num_items)
-    model.compile(optimizer=tf.keras.optimizers.Adagrad(0.5))
+    # 4. Multi-Layer Perceptron (Step 3: z_l = ReLU(W*z + b))
+    mlp_vector = Dense(64, activation='relu')(mlp_vector)
+    mlp_vector = Dense(32, activation='relu')(mlp_vector)
+    mlp_vector = Dense(16, activation='relu')(mlp_vector)
 
-    # Shuffle and split
-    tf.random.set_seed(42)
-    shuffled = ratings.shuffle(100_000, seed=42, reshuffle_each_iteration=False)
-    train_size = int(len(ratings_df_copy) * 0.8)
-    train = shuffled.take(train_size)
-    test = shuffled.skip(train_size)
+    # 5. Prediction Layer (Step 4: Output r_hat)
+    # Using linear activation for continuous rating range (-10 to 10)
+    prediction = Dense(1, activation='linear', name='prediction')(mlp_vector)
 
-    # Train
-    print("Training model...")
-    model.fit(train.batch(2048), epochs=3, verbose=1)
+    # Model Assembly
+    model = Model(inputs=[user_input, item_input], outputs=prediction)
+    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+
+    # Training logic
+    X_user = ratings_df_copy['user_id'].values
+    X_item = ratings_df_copy['joke_id'].values
+    y = ratings_df_copy['rating'].values
+
+    print("Training MLP model...")
+    model.fit(
+        [X_user, X_item], y,
+        batch_size=2048,
+        epochs=3,
+        validation_split=0.2,
+        verbose=1
+    )
     
-    print("Evaluating model...")
-    train_eval = model.evaluate(train.batch(2048), return_dict=True, verbose=0)
-    test_eval = model.evaluate(test.batch(2048), return_dict=True, verbose=0)
-    
-    print(f"TRAIN METRICS: {train_eval}")
-    print(f"TEST METRICS: {test_eval}")
-    print(f"EXPLAINABILITY: Low. Deep learning models learn complex latent factors from user-item interactions.\n")
-
-    # Extract item embeddings as a numpy array for serving (picklable)
-    item_ids_tensor = tf.constant(list(range(num_items)), dtype=tf.int32)
-    item_embeddings = model.item_model(item_ids_tensor).numpy()  # shape: [num_items, 64]
-    return model, item_embeddings
+    return model
 
 
 # ==========================================
@@ -371,17 +366,20 @@ def _build_artifacts(jokes, ratings):
     avg = ratings.groupby("joke_id")["rating"].agg(["mean", "count"]).reset_index()
     avg.columns = ["joke_id", "avg_rating", "num_ratings"]
     popularity_table = avg.sort_values(["avg_rating", "num_ratings"], ascending=False).reset_index(drop=True)
+    print("Popularity ranking")
 
     # 2) Content-based matrices (fit once).
     tfidf = TfidfVectorizer(stop_words="english", max_features=300)
     texts = jokes["joke_text"].fillna("")
     tfidf_matrix = tfidf.fit_transform(texts)
     cosine_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
+    print("Content-based matrices")
 
     # 3) User-based collaborative artifacts (train NearestNeighbors once).
     user_counts = ratings.groupby("user_id").size()
     eligible_users = user_counts[user_counts >= 5].index.to_numpy()
     sampled = ratings[ratings["user_id"].isin(eligible_users)].copy()
+    print("CF artifacts")
 
     print(f"Training user-based k-NN model on all {len(eligible_users)} eligible users...")
     
@@ -395,10 +393,8 @@ def _build_artifacts(jokes, ratings):
     nn_model = NearestNeighbors(n_neighbors=k_neighbors, metric="cosine", algorithm="brute", n_jobs=-1)
     nn_model.fit(user_item_filled.values)
 
-    # 4) Deep learning (two-tower) artifact via TF Recommenders fit once.
-    dl_result = deep_learning_recommender(ratings, jokes)
-    item_embeddings = dl_result[1] if dl_result is not None else None
-
+    # 4) Deep learning recommender
+    dl_model = deep_learning_recommender(ratings, jokes)
     return {
         "popularity_table": popularity_table,
         "candidate_joke_ids": set(popularity_table["joke_id"].astype(int).tolist()),
@@ -408,7 +404,7 @@ def _build_artifacts(jokes, ratings):
         "user_item_filled": user_item_filled,
         "joke_means": joke_means,
         "nn_model": nn_model,
-        "item_embeddings": item_embeddings,
+        "dl_model": dl_model, # Changed from item_embeddings
     }
 
 
@@ -569,32 +565,40 @@ def get_recommendations():
         
         # 4. DEEP LEARNING RECOMMENDATIONS
         try:
-            item_embeddings = ARTIFACTS["item_embeddings"]
-            if item_embeddings is None:
-                raise ValueError("Deep learning model unavailable (TensorFlow/TF-Recommenders not installed)")
+            dl_model = ARTIFACTS.get("dl_model")
+            if dl_model is None:
+                raise ValueError("Deep learning model unavailable (TensorFlow not installed or training failed)")
 
-            # Cold-start: represent the new user as a weighted average of rated item embeddings
-            rated_embeddings = [
-                item_embeddings[int(jid)] * float(rating)
-                for jid, rating in user_ratings.items()
-                if int(jid) in candidate_jokes
+            # Cold-start workaround for NeuMF: 
+            # Borrow the most similar user ID found during the CF step to act as a proxy
+            try:
+                proxy_user_id = int(neighbor_ids[0])
+            except (NameError, IndexError):
+                proxy_user_id = 0 # Fallback if CF failed
+
+            unrated_jokes = list(candidate_jokes - rated_jokes)
+            
+            # Prepare batch arrays for the model
+            user_array = np.array([proxy_user_id] * len(unrated_jokes))
+            item_array = np.array(unrated_jokes)
+
+            # Predict ratings in one batch
+            preds = dl_model.predict([user_array, item_array], verbose=0).flatten()
+            
+            predictions_dl = [
+                {'joke_id': int(jid), 'pred_rating': float(pred)} 
+                for jid, pred in zip(unrated_jokes, preds)
             ]
-            user_embedding = np.mean(rated_embeddings, axis=0)
-
-            unrated_jokes = candidate_jokes - rated_jokes
-            predictions_dl = []
-            for joke_id in unrated_jokes:
-                score = float(np.dot(user_embedding, item_embeddings[joke_id]))
-                predictions_dl.append({'joke_id': int(joke_id), 'pred_rating': score})
 
             max_score = max((p['pred_rating'] for p in predictions_dl), default=1.0)
             top_3_dl = sorted(predictions_dl, key=lambda x: x['pred_rating'], reverse=True)[:3]
+            
             recommendations['deep_learning'] = [
                 {
                     'joke_id': rec['joke_id'],
                     'joke_text': jokes_df[jokes_df['joke_id'] == rec['joke_id']]['joke_text'].values[0],
                     'confidence': round(max(0, rec['pred_rating']) / max(1e-9, abs(max_score)) * 100, 1),
-                    'reasoning': f"This joke matches hidden patterns learned from your rating behavior (confidence: {round(max(0, rec['pred_rating']) / max(1e-9, abs(max_score)) * 100, 1)}%). Deep learning captures complex preferences beyond simple similarity."
+                    'reasoning': f"Based on deep non-linear pattern matching using a profile similar to yours (Proxy User {proxy_user_id}). NeuMF captures deeper preferences beyond simple similarity."
                 }
                 for rec in top_3_dl
             ]
@@ -728,7 +732,7 @@ def evaluate_recommenders(
 
     results = []
 
-    def _compute_metrics(name, ranked_lists):
+    def _compute_metrics(name, ranked_lists, ):
         recalls = []
         top_hits = []
 
@@ -873,55 +877,46 @@ def evaluate_recommenders(
     # 4) Deep learning (embedding-based ranked retrieval)
     if include_deep_learning:
         try:
-            dl_result = deep_learning_recommender(train_df, jokes_df_eval)
-            if dl_result is None:
-                raise ValueError("Deep learning dependencies unavailable")
-
-            item_embeddings = dl_result[1]
-            emb_count = len(item_embeddings)
-            item_norms = np.linalg.norm(item_embeddings, axis=1)
-
-            user_embeddings = {}
-            for uid, grp in train_df.groupby("user_id"):
-                item_ids = grp["joke_id"].to_numpy(dtype=int)
-                ratings_vals = grp["rating"].to_numpy(dtype=float)
-                valid = (item_ids >= 0) & (item_ids < emb_count)
-                if not np.any(valid):
-                    continue
-
-                vecs = item_embeddings[item_ids[valid]]
-                w = ratings_vals[valid]
-                if np.sum(np.abs(w)) < 1e-9:
-                    user_embeddings[uid] = vecs.mean(axis=0)
-                else:
-                    # Signed weighting keeps dislike/like direction in user representation.
-                    user_embeddings[uid] = np.average(vecs, axis=0, weights=w)
-
-            deep_learning_ranked = {}
-            for uid in eligible_eval_users:
-                seen_jokes = train_seen_by_user[uid]
-                if uid not in user_embeddings:
-                    deep_learning_ranked[uid] = _sorted_unseen_items(popularity_scores, seen_jokes)
-                    continue
-
-                u = user_embeddings[uid]
-                score_map = {}
-                for joke_id in joke_ids:
-                    joke_id_int = int(joke_id)
-                    if joke_id_int in seen_jokes or joke_id_int >= emb_count:
-                        continue
-
-                    v = item_embeddings[joke_id_int]
-                    denom = np.linalg.norm(u) * item_norms[joke_id_int]
-                    if denom < 1e-12:
-                        score = float(train_joke_means.get(joke_id_int, global_mean))
-                    else:
-                        score = float(np.dot(u, v) / denom)
-                    score_map[joke_id_int] = score
-
-                deep_learning_ranked[uid] = _sorted_unseen_items(score_map, seen_jokes)
-
-            _compute_metrics("Deep Learning", deep_learning_ranked)
+            print("Generating MLP predictions for all users (Vectorized)...")
+            dl_model = ARTIFACTS.get("dl_model")
+            dl_ranked = {}
+            
+            # We'll evaluate a sample of users to keep it fast, or all if you have time
+            eval_sample = top_eval_users[:2000] # Adjust this number based on your patience!
+            
+            # 1. Create a massive batch of all user-item combinations
+            # For 2000 users and 100 jokes, this is only 200k rows—very easy for TF.
+            all_user_ids = []
+            all_item_ids = []
+            for uid in eval_sample:
+                for jid in joke_ids:
+                    all_user_ids.append(uid)
+                    all_item_ids.append(jid)
+                    
+            # 2. Run prediction in one giant batch
+            user_batch = np.array(all_user_ids)
+            item_batch = np.array(all_item_ids)
+            
+            # Using model() instead of .predict() is often faster for inference
+            all_preds = dl_model.predict([user_batch, item_batch], batch_size=1024, verbose=1).flatten()
+            
+            # 3. Reshape results back into a user -> ranked_list dictionary
+            prediction_idx = 0
+            for uid in eval_sample:
+                seen_jokes = train_seen_by_user.get(uid, set())
+                user_scores = []
+                
+                for jid in joke_ids:
+                    score = all_preds[prediction_idx]
+                    if jid not in seen_jokes:
+                        user_scores.append((int(jid), float(score)))
+                    prediction_idx += 1
+                    
+                # Sort by score descending
+                user_scores.sort(key=lambda x: x[1], reverse=True)
+                dl_ranked[uid] = [jid for jid, _ in user_scores]
+            
+            _compute_metrics("MLP Deep Learning", dl_ranked)
         except Exception as e:
             if verbose:
                 print(f"Deep Learning        ERROR: {e}")
@@ -1014,7 +1009,7 @@ def ensure_evaluation_results_cached():
             return cached
 
     print("Precomputing evaluation results cache...")
-    include_deep_learning = ARTIFACTS.get("item_embeddings") is not None if ARTIFACTS else False
+    include_deep_learning = ARTIFACTS.get("dl_model") is not None if ARTIFACTS else False
     results = evaluate_recommenders(
         jokes_df,
         ratings_df,
