@@ -321,7 +321,7 @@ def deep_learning_recommender(ratings_df, jokes_df):
     model.fit(
         [X_user, X_item], y,
         batch_size=2048,
-        epochs=3,
+        epochs=10,
         validation_split=0.2,
         verbose=1
     )
@@ -616,30 +616,7 @@ def get_recommendations():
 # STANDALONE ANALYSIS MODE
 # ==========================================
 
-def main():
-    """Run as standalone analysis script"""
-    # Load the datasets
-    jokes_df_local, ratings_df_local = load_jester_dataset()
-    
-    # Prepare data for models
-    jokes_df_local, ratings_df_local = prepare_data_for_models(jokes_df_local, ratings_df_local)
-    
-    # Inspect the data structure
-    print("\n--- DATA STRUCTURE ---")
-    print(f"\nJokes DataFrame:")
-    print(jokes_df_local.head())
-    print(f"\nRatings DataFrame:")
-    print(ratings_df_local.head())
-    
-    # Run the recommender models with your loaded data
-    print("\n" + "="*60)
-    popularity_recommender(jokes_df_local, ratings_df_local, top_n=5)
-    
-    print("="*60)
-    content_based_recommender(jokes_df_local, target_joke_id=0, top_n=5)
-    
-    print("="*60)
-    memory_based_cf(ratings_df_local)
+
 
 
 def evaluate_recommenders(
@@ -879,11 +856,15 @@ def evaluate_recommenders(
         try:
             print("Generating MLP predictions for all users (Vectorized)...")
             dl_model = ARTIFACTS.get("dl_model")
+            if(dl_model == None):
+                dl_model = deep_learning_recommender(ratings_df, jokes_df)
+                ARTIFACTS["dl_model"]= dl_model
+                 
             dl_ranked = {}
             
             # We'll evaluate a sample of users to keep it fast, or all if you have time
-            eval_sample = top_eval_users[:2000] # Adjust this number based on your patience!
-            
+            #eval_sample = top_eval_users[:2000] # Adjust this number based on your patience!
+            eval_sample = top_eval_users
             # 1. Create a massive batch of all user-item combinations
             # For 2000 users and 100 jokes, this is only 200k rows—very easy for TF.
             all_user_ids = []
@@ -980,6 +961,7 @@ def get_or_build_evaluation_results(force_refresh=False):
 
     jokes_df_local, ratings_df_local = load_jester_dataset(use_cache=True)
     jokes_df_local, ratings_df_local = prepare_data_for_models(jokes_df_local, ratings_df_local)
+
     results = evaluate_recommenders(
         jokes_df_local,
         ratings_df_local,
@@ -987,7 +969,7 @@ def get_or_build_evaluation_results(force_refresh=False):
         random_state=42,
         top_n=10,
         relevance_threshold=0.0,
-        include_deep_learning=False,
+        include_deep_learning=True,
         verbose=False,
     )
 
@@ -1052,6 +1034,49 @@ def evaluation_results():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+def main():
+    # Load the datasets
+    jokes_df_local, ratings_df_local = load_jester_dataset()
+    
+    # Prepare data for models
+    jokes_df_local, ratings_df_local = prepare_data_for_models(jokes_df_local, ratings_df_local)
+    
+    # Inspect the data structure
+    print("\n--- DATA STRUCTURE ---")
+    print(f"\nJokes DataFrame:")
+    print(jokes_df_local.head())
+    print(f"\nRatings DataFrame:")
+    print(ratings_df_local.head())
+    
+    # Run the recommender models with your loaded data
+    print("\n" + "="*60)
+    popularity_recommender(jokes_df_local, ratings_df_local, top_n=5)
+    
+    print("="*60)
+    content_based_recommender(jokes_df_local, target_joke_id=0, top_n=5)
+    
+    print("="*60)
+    memory_based_cf(ratings_df_local)
+
+def split_data_per_user(ratings_df, test_size=0.3, random_state=42):
+    """Splits ratings into train/test, ensuring each user has items in both."""
+    rng = np.random.default_rng(random_state)
+    train_list, test_list = [], []
+
+    for _, group in ratings_df.groupby("user_id"):
+        if len(group) < 2:
+            train_list.append(group) # Can't split 1 rating
+            continue
+            
+        # Shuffle and split
+        shuffled = group.sample(frac=1, random_state=random_state)
+        n_test = max(1, int(len(group) * test_size))
+        
+        test_list.append(shuffled.iloc[:n_test])
+        train_list.append(shuffled.iloc[n_test:])
+
+    return pd.concat(train_list), pd.concat(test_list)
+
 
 if __name__ == '__main__':
     import sys
@@ -1061,10 +1086,25 @@ if __name__ == '__main__':
         # Run standalone analysis
         main()
     elif len(sys.argv) > 1 and sys.argv[1] == 'evaluate':
+        print("evaluating models")
+
+
+
         # Run objective 70/30 evaluation of all methods
         jokes_df_local, ratings_df_local = load_jester_dataset(use_cache=True)
         jokes_df_local, ratings_df_local = prepare_data_for_models(jokes_df_local, ratings_df_local)
+
+
+        # 1. SPLIT DATA FIRST (To prevent leakage)
+        train_df, test_df = split_data_per_user(ratings_df_local, test_size=0.3)
+        
+        # 2. TRAIN MLP ON TRAIN_DF ONLY
+        # This prevents the model from "memorizing" the test answers
+        dl_model = deep_learning_recommender(train_df, jokes_df_local)
+        ARTIFACTS["dl_model"] = dl_model
+
         evaluate_recommenders(jokes_df_local, ratings_df_local, test_size=0.3, random_state=42, verbose=True)
+        
     else:
         # Run Flask web app (default)
         init_app()
