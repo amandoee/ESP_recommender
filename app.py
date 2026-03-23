@@ -269,8 +269,10 @@ def deep_learning_recommender(ratings_df, jokes_df):
     print("--- MLP DEEP LEARNING MODEL ---")
     try:
         import tensorflow as tf
-        from tensorflow.keras.layers import Input, Embedding, Flatten, Concatenate, Dense
+        from tensorflow.keras.layers import Input, Embedding, Flatten, Concatenate, Dense, Dropout, BatchNormalization
         from tensorflow.keras.models import Model
+        from tensorflow.keras.regularizers import l2
+        from tensorflow.keras.callbacks import EarlyStopping
     except ImportError:
         print(f"Error: tensorflow not available.")
         return None
@@ -296,36 +298,46 @@ def deep_learning_recommender(ratings_df, jokes_df):
     user_flat = Flatten()(user_emb)
     item_flat = Flatten()(item_emb)
 
-    # 3. Concatenation (Step 2: z_0 = [p_u, q_i])
+    # 3. Concatenation + Normalization
     mlp_vector = Concatenate()([user_flat, item_flat])
-    
-    # 4. Multi-Layer Perceptron (Step 3: z_l = ReLU(W*z + b))
+    mlp_vector = BatchNormalization()(mlp_vector)
+
+    # 4. Dense Layers with Dropout (The "Anti-Overfit" layers)
     mlp_vector = Dense(64, activation='relu')(mlp_vector)
+    mlp_vector = Dropout(0.4)(mlp_vector) # Randomly "shuts off" 40% of neurons
+    
     mlp_vector = Dense(32, activation='relu')(mlp_vector)
-    mlp_vector = Dense(16, activation='relu')(mlp_vector)
+    mlp_vector = Dropout(0.2)(mlp_vector)
 
-    # 5. Prediction Layer (Step 4: Output r_hat)
-    # Using linear activation for continuous rating range (-10 to 10)
-    prediction = Dense(1, activation='linear', name='prediction')(mlp_vector)
+    # 5. Prediction Layer (Sigmoid for [0, 1] range)
+    prediction = Dense(1, activation='sigmoid', name='prediction')(mlp_vector)
 
-    # Model Assembly
     model = Model(inputs=[user_input, item_input], outputs=prediction)
-    model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=0.001), loss='mse', metrics=['mae'])
+    model.compile(optimizer='adam', loss='mse', metrics=['mae'])
 
-    # Training logic
+    # 6. Early Stopping: Stops training once val_loss stops improving
+    early_stop = EarlyStopping(
+        monitor='val_loss', 
+        patience=2, 
+        restore_best_weights=True
+    )
+
+    # Use the actual column values from the DataFrame, not the Keras Input objects
     X_user = ratings_df_copy['user_id'].values
     X_item = ratings_df_copy['joke_id'].values
-    y = ratings_df_copy['rating'].values
+    y_train_scaled = (ratings_df_copy['rating'].values + 10.0) / 20.0
 
-    print("Training MLP model...")
+    # Correct model.fit call
     model.fit(
-        [X_user, X_item], y,
+        [X_user, X_item], # These are your inputs
+        y_train_scaled,   # These are your targets
         batch_size=2048,
-        epochs=10,
+        epochs=20,
         validation_split=0.2,
+        callbacks=[early_stop],
         verbose=1
     )
-    
+        
     return model
 
 
@@ -447,6 +459,40 @@ def index():
     jokes_list = random_jokes[['joke_id', 'joke_text']].to_dict('records')
     
     return render_template('index.html', jokes=jokes_list)
+
+@app.route('/evaluation-results')
+def get_evaluation():
+    try:
+        cache_file = _cache_paths()["evaluation"]
+        with cache_file.open("rb") as f:
+            cached = pickle.load(f)
+
+        meta = cached["split_meta"]
+        response_data = {
+            "metrics": [
+                {"method": name, "recall_score": float(r), "top_score": float(t)}
+                for name, r, t in cached["results"]
+            ],
+            "split": {
+                "train_percent": 70,
+                "test_percent": 30,
+                "train_count": meta["train_count"],
+                "test_count": meta["test_count"],
+                "users_evaluated": meta["users_evaluated"],
+                "users_top_evaluated": meta["users_top_evaluated"],
+                "random_state": 42
+            },
+            "metric_name": "Recall@10",
+            "top_metric_name": "Top@10",
+            "top_metric_definition": "Search space restricted to user's test set items only",
+            "relevance_threshold": 0.0,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"Evaluation Error: {e}")
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/get-recommendations', methods=['POST'])
 def get_recommendations():
@@ -598,7 +644,7 @@ def get_recommendations():
                     'joke_id': rec['joke_id'],
                     'joke_text': jokes_df[jokes_df['joke_id'] == rec['joke_id']]['joke_text'].values[0],
                     'confidence': round(max(0, rec['pred_rating']) / max(1e-9, abs(max_score)) * 100, 1),
-                    'reasoning': f"Based on deep non-linear pattern matching using a profile similar to yours (Proxy User {proxy_user_id}). NeuMF captures deeper preferences beyond simple similarity."
+                    'reasoning': f"Based on deep non-linear pattern matching predicting what score"
                 }
                 for rec in top_3_dl
             ]
@@ -615,339 +661,177 @@ def get_recommendations():
 # ==========================================
 # STANDALONE ANALYSIS MODE
 # ==========================================
-
-
-
-
-def evaluate_recommenders(
-    jokes_df_eval,
-    ratings_df_eval,
-    test_size=0.3,
-    random_state=42,
-    top_n=10,
-    relevance_threshold=0.0,
-    include_deep_learning=True,
-    verbose=True,
-):
-    """Evaluate recommenders with per-user joke holdout Recall@10 and Top@10 on test ranking."""
+def evaluate_recommenders(jokes_df_eval, train_df, test_df, top_n=10, relevance_threshold=0.0, include_deep_learning=True, verbose=True):
+    """
+    Complete evaluation suite: Popularity, Content-Based, Collaborative (k-NN), and MLP.
+    All models are trained ONLY on train_df and evaluated against test_df.
+    """
     if verbose:
         print("\n" + "=" * 80)
-        print(f"OBJECTIVE EVALUATION (PER-USER JOKE HOLDOUT RECALL@{top_n} + TOP@{top_n})")
+        print(f"OBJECTIVE EVALUATION (RECALL@{top_n} & TOP@{top_n})")
         print("=" * 80)
 
-    ratings_clean = ratings_df_eval.dropna(subset=["rating"]).copy()
-    joke_ids = np.sort(ratings_clean["joke_id"].astype(int).unique())
-    jokes_sorted = (
-        jokes_df_eval[jokes_df_eval["joke_id"].isin(joke_ids)]
-        .sort_values("joke_id")
-        .reset_index(drop=True)
-    )
+    # 1. Setup metadata
+    joke_ids = np.sort(train_df["joke_id"].unique())
     item_to_col = {int(jid): idx for idx, jid in enumerate(joke_ids)}
-
-    rng = np.random.default_rng(random_state)
-    train_parts = []
-    test_parts = []
-    users_considered = 0
-    users_skipped_for_split = 0
-
-    for user_id, group in ratings_clean.groupby("user_id", sort=True):
-        group = group.sample(frac=1.0, random_state=int(rng.integers(0, 2**31 - 1))).reset_index(drop=True)
-        total_rated = len(group)
-        if total_rated < 2:
-            users_skipped_for_split += 1
-            continue
-
-        test_count = max(1, int(np.ceil(total_rated * test_size)))
-        if test_count >= total_rated:
-            test_count = total_rated - 1
-
-        train_count = total_rated - test_count
-        if train_count < 1:
-            users_skipped_for_split += 1
-            continue
-
-        train_parts.append(group.iloc[:train_count].copy())
-        test_parts.append(group.iloc[train_count:].copy())
-        users_considered += 1
-
-    if not train_parts or not test_parts:
-        raise ValueError("Not enough ratings to build a per-user joke holdout evaluation split")
-
-    train_df = pd.concat(train_parts, ignore_index=True)
-    test_df = pd.concat(test_parts, ignore_index=True)
-
-    if verbose:
-        print(f"Train size: {len(train_df):,} ratings ({(1 - test_size) * 100:.0f}%)")
-        print(f"Test size:  {len(test_df):,} ratings ({test_size * 100:.0f}%)")
-        print(f"Users with valid train/test holdout: {users_considered:,}")
-        if users_skipped_for_split:
-            print(f"Users skipped during split: {users_skipped_for_split:,}")
-
-    global_mean = float(train_df["rating"].mean())
+    global_mean = train_df["rating"].mean()
     train_joke_means = train_df.groupby("joke_id")["rating"].mean()
-
-    test_by_user = {
-        uid: grp[["joke_id", "rating"]].copy().reset_index(drop=True)
-        for uid, grp in test_df.groupby("user_id", sort=False)
-    }
-    train_seen_by_user = {
-        uid: set(grp["joke_id"].astype(int).tolist())
-        for uid, grp in train_df.groupby("user_id", sort=False)
-    }
-    eligible_eval_users = []
-    relevant_test_by_user = {}
-    for uid, test_user in test_by_user.items():
-        relevant = set(test_user.loc[test_user["rating"] > relevance_threshold, "joke_id"].astype(int).tolist())
-        if relevant:
-            eligible_eval_users.append(uid)
-            relevant_test_by_user[uid] = relevant
-
-    if not eligible_eval_users:
-        raise ValueError("No users have relevant held-out test jokes for Recall@10 evaluation")
-
-    top_eval_users = [uid for uid, user_test in test_by_user.items() if len(user_test) > 0]
+    
+    # Track which jokes each user has already seen in training
+    train_seen_by_user = train_df.groupby("user_id")["joke_id"].apply(set).to_dict()
+    
+    # Identify users eligible for Recall evaluation (those with at least one 'relevant' test joke)
+    test_by_user = {uid: grp for uid, grp in test_df.groupby("user_id")}
+    eligible_eval_users = [
+        uid for uid, grp in test_by_user.items() 
+        if (grp["rating"] > relevance_threshold).any()
+    ]
 
     results = []
 
-    def _compute_metrics(name, ranked_lists, ):
+    def _compute_metrics(name, user_rankings):
+        """
+        user_rankings: dict where keys are user_ids and values are 
+        all unseen joke_ids sorted by predicted score (descending).
+        """
         recalls = []
         top_hits = []
 
-        for uid in eligible_eval_users:
-            ranked_items = ranked_lists.get(uid, [])
-            predicted_top = ranked_items[:top_n]
-            relevant = relevant_test_by_user[uid]
-            hit_count = len(set(predicted_top) & relevant)
-            recalls.append(hit_count / len(relevant))
+        # Users for Recall: Must have at least one relevant test item (> 0.0)
+        users_with_relevant = [u for u in eligible_eval_users if u in user_rankings]
+        
+        # Users for Top@N: All users with at least one item in the test set
+        users_with_test = [u for u in test_by_user.keys() if u in user_rankings]
 
-        for uid in top_eval_users:
-            user_test = test_by_user[uid]
-            test_jokes = set(user_test["joke_id"].astype(int).tolist())
-            if not test_jokes:
-                continue
+        # 1. Compute Recall@N
+        for uid in users_with_relevant:
+            # TopN(u) excluding items seen during training
+            top_n_rec = user_rankings[uid][:top_n]
+            
+            # Relevant(u): items in test set > threshold
+            relevant_items = set(test_by_user[uid].loc[test_by_user[uid]["rating"] > relevance_threshold, "joke_id"])
+            
+            hit_count = len(set(top_n_rec) & relevant_items)
+            recalls.append(hit_count / len(relevant_items))
 
-            actual_top = (
-                user_test.sort_values(["rating", "joke_id"], ascending=[False, True])["joke_id"]
-                .astype(int)
-                .tolist()[:top_n]
-            )
-            if not actual_top:
-                continue
+        # 2. Compute Top@N
+        for uid in users_with_test:
+            user_test_df = test_by_user[uid]
+            test_joke_ids = set(user_test_df["joke_id"].unique())
+            
+            # ActualTop(u): Top items from the user's test set sorted by rating
+            actual_top = set(user_test_df.sort_values(by="rating", ascending=False)["joke_id"].iloc[:top_n])
+            
+            # TopN(u): Filter predictions to ONLY include items in the user's test set
+            # Then take the top N of those
+            predicted_in_test = [jid for jid in user_rankings[uid] if jid in test_joke_ids]
+            predicted_top_test = set(predicted_in_test[:top_n])
+            
+            # Intersection
+            top_hit_rate = len(predicted_top_test & actual_top) / len(actual_top)
+            top_hits.append(top_hit_rate)
 
-            ranked_items = ranked_lists.get(uid, [])
-            predicted_test_ranked = [int(jid) for jid in ranked_items if int(jid) in test_jokes]
-            predicted_top = predicted_test_ranked[:top_n]
+        recall_final = np.mean(recalls) if recalls else 0
+        top_final = np.mean(top_hits) if top_hits else 0
+        
+        results.append((name, recall_final, top_final))
+        print(f"{name:<20} Recall@{top_n}={recall_final:.4f} | Top@{top_n}={top_final:.4f}")
 
-            top_hit = len(set(predicted_top) & set(actual_top)) / len(actual_top)
-            top_hits.append(top_hit)
-
-        recall_score = float(np.mean(recalls)) if recalls else 0.0
-        top_score = float(np.mean(top_hits)) if top_hits else 0.0
-        results.append((name, recall_score, top_score))
-        if verbose:
-            print(f"{name:<20} Recall@{top_n}={recall_score:.4f} | Top@{top_n}={top_score:.4f}")
-
-    def _sorted_unseen_items(score_map, seen_jokes):
-        return [
-            joke_id
-            for joke_id, _ in sorted(score_map.items(), key=lambda item: item[1], reverse=True)
-            if joke_id not in seen_jokes
-        ]
-
-    # 1) Popularity baseline
-    popularity_scores = {int(jid): float(train_joke_means.get(jid, global_mean)) for jid in joke_ids}
-    popularity_ranked = {
-        uid: _sorted_unseen_items(popularity_scores, train_seen_by_user[uid])
-        for uid in eligible_eval_users
-    }
-    _compute_metrics("Popularity", popularity_ranked)
-
-    # 1b) Random top-N baseline
-    random_ranked = {}
+    # --- METHOD 1: Popularity (Baseline) ---
+    pop_scores = {jid: train_joke_means.get(jid, global_mean) for jid in joke_ids}
+    pop_ranked = {}
     for uid in eligible_eval_users:
-        seen_jokes = train_seen_by_user[uid]
-        unseen_jokes = [int(joke_id) for joke_id in joke_ids if int(joke_id) not in seen_jokes]
-        user_rng = np.random.default_rng(random_state + int(uid))
-        shuffled = list(user_rng.permutation(unseen_jokes))
-        random_ranked[uid] = shuffled
+        seen = train_seen_by_user.get(uid, set())
+        # Sort all jokes by pop, then filter seen
+        sorted_jokes = sorted(pop_scores, key=pop_scores.get, reverse=True)
+        pop_ranked[uid] = [j for j in sorted_jokes if j not in seen]
+    _compute_metrics("Popularity", pop_ranked)
 
-    _compute_metrics("Random Top-10", random_ranked)
-
-    # 2) Content-based ranking using user train-history weights
+    # --- METHOD 2: Content-Based ---
     tfidf = TfidfVectorizer(stop_words="english", max_features=300)
+    # Sort jokes to match the joke_ids order for the similarity matrix
+    jokes_sorted = jokes_df_eval[jokes_df_eval["joke_id"].isin(joke_ids)].sort_values("joke_id")
     tfidf_matrix = tfidf.fit_transform(jokes_sorted["joke_text"].fillna(""))
     item_sim = linear_kernel(tfidf_matrix, tfidf_matrix)
 
-    user_item_train = train_df.pivot_table(
-        index="user_id",
-        columns="joke_id",
-        values="rating",
-        aggfunc="mean",
-    ).reindex(columns=joke_ids)
-
     content_ranked = {}
     for uid in eligible_eval_users:
-        user_row = user_item_train.loc[uid]
-        seen_jokes = train_seen_by_user[uid]
-        seen_cols = [item_to_col[jid] for jid in seen_jokes if jid in item_to_col]
-        if not seen_cols:
-            content_ranked[uid] = _sorted_unseen_items(popularity_scores, seen_jokes)
+        user_ratings = train_df[train_df['user_id'] == uid]
+        seen = train_seen_by_user.get(uid, set())
+        
+        if user_ratings.empty:
+            content_ranked[uid] = pop_ranked.get(uid, [])
             continue
 
-        seen_ratings = np.array([float(user_row.iloc[col]) for col in seen_cols], dtype=float)
-        shifted = (seen_ratings + 10.0) / 20.0
-        if shifted.sum() <= 1e-12:
-            weights = np.full(len(shifted), 1.0 / len(shifted), dtype=float)
-        else:
-            weights = shifted / shifted.sum()
-
-        weighted_scores = np.average(item_sim[seen_cols], axis=0, weights=weights)
-        score_map = {int(jid): float(weighted_scores[item_to_col[int(jid)]]) for jid in joke_ids}
-        content_ranked[uid] = _sorted_unseen_items(score_map, seen_jokes)
-
+        # 1. Shift ratings from [-10, 10] to [0, 20] 
+        # 2. Add a tiny value (1e-9) to avoid the ZeroDivisionError
+        shifted_ratings = user_ratings['rating'].values + 10.0
+        weights = shifted_ratings + 1e-9 
+        
+        indices = [item_to_col[jid] for jid in user_ratings['joke_id'] if jid in item_to_col]
+        
+        if not indices:
+            content_ranked[uid] = pop_ranked.get(uid, [])
+            continue
+            
+        # This will now safely normalize because weights.sum() > 0
+        user_profile = np.average(item_sim[indices], axis=0, weights=weights)
+        
+        score_map = {jid: user_profile[item_to_col[jid]] for jid in joke_ids if jid not in seen}
+        content_ranked[uid] = sorted(score_map, key=score_map.get, reverse=True)
     _compute_metrics("Content-Based", content_ranked)
 
-    # 3) Collaborative filtering (user-based k-NN ranked retrieval)
-    try:
-        if verbose:
-            print("Training collaborative model for evaluation...")
+    # --- METHOD 3: Collaborative Filtering (k-NN) ---
+    user_item_matrix = train_df.pivot(index="user_id", columns="joke_id", values="rating")
+    # Fill with item means for the distance calculation
+    user_item_filled = user_item_matrix.fillna(train_joke_means).fillna(global_mean)
+    
+    nn = NearestNeighbors(metric="cosine", algorithm="brute", n_neighbors=40)
+    nn.fit(user_item_filled.values)
 
-        user_item_cf = train_df.pivot_table(
-            index="user_id",
-            columns="joke_id",
-            values="rating",
-            aggfunc="mean",
-        ).reindex(columns=joke_ids)
+    cf_ranked = {}
+    # Get neighbor indices for all eligible users at once for speed
+    user_indices = [user_item_filled.index.get_loc(uid) for uid in eligible_eval_users]
+    distances, indices = nn.kneighbors(user_item_filled.iloc[user_indices])
 
-        joke_means_cf = user_item_cf.mean(axis=0)
-        user_item_cf_filled = user_item_cf.fillna(joke_means_cf).fillna(global_mean)
+    for i, uid in enumerate(eligible_eval_users):
+        seen = train_seen_by_user.get(uid, set())
+        # Average ratings from the 40 most similar users
+        neighbor_ratings = user_item_matrix.iloc[indices[i]].mean(axis=0)
+        # Fallback to joke means for jokes the neighbors haven't rated
+        pred_scores = neighbor_ratings.fillna(train_joke_means).fillna(global_mean)
+        
+        score_map = {jid: pred_scores.get(jid, global_mean) for jid in joke_ids if jid not in seen}
+        cf_ranked[uid] = sorted(score_map, key=score_map.get, reverse=True)
+    _compute_metrics("Collaborative k-NN", cf_ranked)
 
-        k_neighbors = min(40, len(user_item_cf_filled))
-        nn_model = NearestNeighbors(n_neighbors=k_neighbors, metric="cosine", algorithm="brute", n_jobs=-1)
-        nn_model.fit(user_item_cf_filled.values)
-
-        eval_user_matrix = user_item_cf_filled.loc[eligible_eval_users].to_numpy(dtype=float)
-        _, neighbor_indices = nn_model.kneighbors(eval_user_matrix, return_distance=True)
-        user_item_values = user_item_cf.to_numpy(dtype=float)
-        neighbor_ratings = user_item_values[neighbor_indices]
-        mean_predictions = np.nanmean(neighbor_ratings, axis=1)
-        joke_mean_values = joke_means_cf.to_numpy(dtype=float)
-        mean_predictions = np.where(np.isnan(mean_predictions), joke_mean_values, mean_predictions)
-
-        collaborative_ranked = {}
-        for row_idx, uid in enumerate(eligible_eval_users):
-            seen_jokes = train_seen_by_user[uid]
-            score_row = mean_predictions[row_idx]
-            score_map = {
-                int(joke_id): float(score_row[col_idx])
-                for col_idx, joke_id in enumerate(joke_ids)
-                if int(joke_id) not in seen_jokes
-            }
-
-            collaborative_ranked[uid] = _sorted_unseen_items(score_map, seen_jokes)
-
-        _compute_metrics("Collaborative k-NN", collaborative_ranked)
-    except Exception as e:
-        if verbose:
-            print(f"Collaborative k-NN   ERROR: {e}")
-
-    # 4) Deep learning (embedding-based ranked retrieval)
+    # --- METHOD 4: MLP Deep Learning ---
     if include_deep_learning:
-        try:
-            print("Generating MLP predictions for all users (Vectorized)...")
-            dl_model = ARTIFACTS.get("dl_model")
-            if(dl_model == None):
-                dl_model = deep_learning_recommender(ratings_df, jokes_df)
-                ARTIFACTS["dl_model"]= dl_model
-                 
+        dl_model = ARTIFACTS.get("dl_model")
+        if dl_model:
+            print("Generating MLP predictions (Vectorized)...")
             dl_ranked = {}
-            
-            # We'll evaluate a sample of users to keep it fast, or all if you have time
-            #eval_sample = top_eval_users[:2000] # Adjust this number based on your patience!
-            eval_sample = top_eval_users
-            # 1. Create a massive batch of all user-item combinations
-            # For 2000 users and 100 jokes, this is only 200k rows—very easy for TF.
-            all_user_ids = []
-            all_item_ids = []
-            for uid in eval_sample:
+            all_u, all_j = [], []
+            for uid in eligible_eval_users:
                 for jid in joke_ids:
-                    all_user_ids.append(uid)
-                    all_item_ids.append(jid)
-                    
-            # 2. Run prediction in one giant batch
-            user_batch = np.array(all_user_ids)
-            item_batch = np.array(all_item_ids)
+                    all_u.append(uid); all_j.append(jid)
             
-            # Using model() instead of .predict() is often faster for inference
-            all_preds = dl_model.predict([user_batch, item_batch], batch_size=1024, verbose=1).flatten()
+            preds = dl_model.predict([np.array(all_u), np.array(all_j)], batch_size=4096, verbose=0).flatten()
             
-            # 3. Reshape results back into a user -> ranked_list dictionary
-            prediction_idx = 0
-            for uid in eval_sample:
-                seen_jokes = train_seen_by_user.get(uid, set())
+            idx = 0
+            for uid in eligible_eval_users:
+                seen = train_seen_by_user.get(uid, set())
                 user_scores = []
-                
                 for jid in joke_ids:
-                    score = all_preds[prediction_idx]
-                    if jid not in seen_jokes:
-                        user_scores.append((int(jid), float(score)))
-                    prediction_idx += 1
-                    
-                # Sort by score descending
+                    if jid not in seen:
+                        user_scores.append((jid, preds[idx]))
+                    idx += 1
                 user_scores.sort(key=lambda x: x[1], reverse=True)
-                dl_ranked[uid] = [jid for jid, _ in user_scores]
+                dl_ranked[uid] = [x[0] for x in user_scores]
             
             _compute_metrics("MLP Deep Learning", dl_ranked)
-        except Exception as e:
-            if verbose:
-                print(f"Deep Learning        ERROR: {e}")
 
-    if results:
-        if verbose:
-            print("\n" + "-" * 80)
-            print(f"RANKING (higher Top@{top_n}, then Recall@{top_n}, is better)")
-            print("-" * 80)
-        ranked_results = sorted(results, key=lambda x: (x[2], x[1]), reverse=True)
-        for rank, (name, recall_score, top_score) in enumerate(ranked_results, start=1):
-            if verbose:
-                print(f"{rank}. {name:<20} Top@{top_n}={top_score:.4f} | Recall@{top_n}={recall_score:.4f}")
-
-    if verbose:
-        print("=" * 80)
-
-    ranking = sorted(results, key=lambda x: (x[2], x[1]), reverse=True)
-    metrics = [
-        {
-            "method": name,
-            "recall_score": round(recall_score, 4),
-            "top_score": round(top_score, 4),
-        }
-        for name, recall_score, top_score in ranking
-    ]
-
-    return {
-        "cache_version": EVALUATION_CACHE_VERSION,
-        "metric_name": f"Recall@{top_n}",
-        "top_metric_name": f"Top@{top_n}",
-        "top_metric_definition": "For each user, rank only held-out test jokes by predicted score and compare predicted Top-10 with actual Top-10 by true test rating.",
-        "top_n": int(top_n),
-        "relevance_threshold": float(relevance_threshold),
-        "split": {
-            "train_count": int(len(train_df)),
-            "test_count": int(len(test_df)),
-            "train_percent": int((1 - test_size) * 100),
-            "test_percent": int(test_size * 100),
-            "random_state": int(random_state),
-            "users_considered": int(users_considered),
-            "users_skipped_for_split": int(users_skipped_for_split),
-            "users_evaluated": int(len(eligible_eval_users)),
-            "users_without_relevant_test": int(users_considered - len(eligible_eval_users)),
-            "users_top_evaluated": int(len(top_eval_users)),
-        },
-        "metrics": metrics,
-        "generated_at": datetime.now().isoformat(timespec="seconds"),
-    }
-
+    return results
 
 def get_or_build_evaluation_results(force_refresh=False):
     """Load cached evaluation results or compute them on demand."""
@@ -979,35 +863,53 @@ def get_or_build_evaluation_results(force_refresh=False):
     return results
 
 
-def ensure_evaluation_results_cached():
-    """Build the evaluation cache ahead of time so the UI only reads stored results."""
+def ensure_evaluation_results_cached(force_refresh=False):
     cache_file = _cache_paths()["evaluation"]
 
-    if cache_file.exists():
+    if cache_file.exists() and not force_refresh:
         with cache_file.open("rb") as f:
             cached = pickle.load(f)
         if _is_cached_evaluation_current(cached):
             print("Evaluation results cache is current.")
-            return cached
+            return cached["results"]   # ← return just the list
 
-    print("Precomputing evaluation results cache...")
-    include_deep_learning = ARTIFACTS.get("dl_model") is not None if ARTIFACTS else False
+    print("Refreshing evaluation results cache...")
+    dl_model = ARTIFACTS.get("dl_model")
+    train_df, test_df = split_data_per_user(ratings_df, test_size=0.3)
+
     results = evaluate_recommenders(
-        jokes_df,
-        ratings_df,
-        test_size=0.3,
-        random_state=42,
+        jokes_df_eval=jokes_df,
+        train_df=train_df,
+        test_df=test_df,
         top_n=10,
         relevance_threshold=0.0,
-        include_deep_learning=include_deep_learning,
-        verbose=False,
+        include_deep_learning=(dl_model is not None),
+        verbose=True,
     )
 
-    with cache_file.open("wb") as f:
-        pickle.dump(results, f)
+    # Save as a dict so _is_cached_evaluation_current() can validate it
+    train_df, test_df = split_data_per_user(ratings_df, test_size=0.3)
+    test_by_user = {uid: grp for uid, grp in test_df.groupby("user_id")}
+    users_eval = [uid for uid, grp in test_by_user.items() if (grp["rating"] > 0.0).any()]
 
-    print("Evaluation results cached.")
-    return results
+    payload = {
+        "cache_version": EVALUATION_CACHE_VERSION,
+        "metric_name": "Recall@10",
+        "top_metric_name": "Top@10",
+        "results": results,
+        # Save counts so the route never has to re-split
+        "split_meta": {
+            "train_count": len(train_df),
+            "test_count": len(test_df),
+            "users_evaluated": len(users_eval),
+            "users_top_evaluated": len(test_by_user),
+        }
+    }
+    with cache_file.open("wb") as f:
+        pickle.dump(payload, f)
+
+    print(f"Evaluation results cached to {cache_file}")
+    return results   # ← always return just the list
 
 
 def get_cached_evaluation_results():
@@ -1024,16 +926,15 @@ def get_cached_evaluation_results():
 
     return cached
 
-
+"""
 @app.route('/evaluation-results', methods=['GET'])
 def evaluation_results():
-    """Return per-user joke-holdout Recall@10 results for all recommendation methods."""
     try:
         results = get_cached_evaluation_results()
         return jsonify(results)
     except Exception as e:
         return jsonify({"error": str(e)}), 500
-
+"""
 def main():
     # Load the datasets
     jokes_df_local, ratings_df_local = load_jester_dataset()
@@ -1087,9 +988,6 @@ if __name__ == '__main__':
         main()
     elif len(sys.argv) > 1 and sys.argv[1] == 'evaluate':
         print("evaluating models")
-
-
-
         # Run objective 70/30 evaluation of all methods
         jokes_df_local, ratings_df_local = load_jester_dataset(use_cache=True)
         jokes_df_local, ratings_df_local = prepare_data_for_models(jokes_df_local, ratings_df_local)
@@ -1103,8 +1001,13 @@ if __name__ == '__main__':
         dl_model = deep_learning_recommender(train_df, jokes_df_local)
         ARTIFACTS["dl_model"] = dl_model
 
-        evaluate_recommenders(jokes_df_local, ratings_df_local, test_size=0.3, random_state=42, verbose=True)
-        
+        #evaluate_recommenders(jokes_df_local, ratings_df_local, test_size=0.3, random_state=42, verbose=True)
+        evaluate_recommenders(
+            jokes_df_eval=jokes_df_local, 
+            train_df=train_df, 
+            test_df=test_df, 
+            verbose=True
+        )
     else:
         # Run Flask web app (default)
         init_app()
